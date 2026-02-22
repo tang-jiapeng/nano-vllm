@@ -7,36 +7,12 @@ from nanovllm.engine.block_manager import BlockManager
 
 class Scheduler:
     """
-    调度器，负责管理请求的调度和状态转换。
-
-    核心功能：
-    1. 管理两个队列：waiting（等待队列）和running（运行队列）
-    2. 实现两级调度：prefill（预填入）和decode（解码）
-    3. 批处理优化，平衡吞吐量和延迟
-    4. 管理KV-cache块的分配和释放
-    5. 处理内存不足时的抢占（preemption）
-
-    调度策略：
-    - Prefill阶段：批量处理所有新到达的请求，优先高吞吐量
-    - Decode阶段：逐个生成token，优先低延迟
-    - 内存管理：当KV-cache不足时，优先抢占最长的序列
+    调度器，管理 waiting/running 双队列，实现 prefill/decode 两级调度，
+    处理 KV-cache 分配和内存不足时的 preemption。
     """
 
     def __init__(self, config: Config):
-        """
-        初始化调度器
-
-        使用方法：
-        scheduler = Scheduler(config)
-
-        参数：
-        - config: 配置对象，包含所有调度相关的参数
-
-        初始化内容：
-        1. 设置最大并发序列数和批处理token数
-        2. 创建BlockManager管理KV-cache
-        3. 初始化waiting和running队列
-        """
+        """初始化调度器，创建 BlockManager 及 waiting/running 队列。"""
         # 最大并发序列数（同时运行的序列数量）
         self.max_num_seqs = config.max_num_seqs
 
@@ -59,76 +35,22 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
 
     def is_finished(self):
-        """
-        检查是否所有序列都已完成。
-
-        使用方法：
-        if scheduler.is_finished():
-            print("所有请求已完成")
-
-        返回值：
-        - True: 所有队列都为空，调度完成
-        - False: 还有未完成的序列
-
-        使用场景：
-        1. 判断是否继续推理循环
-        2. 监控调度器状态
-        3. 优雅退出判断条件
-        """
+        """所有队列均为空时返回 True。"""
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        """
-        添加一个新序列到等待队列
-
-        使用方法：
-        scheduler.add(seq)
-
-        参数：
-        - seq: Sequence对象，包含token ID和采样参数
-
-        使用场景：
-        1. 接收新的推理请求
-        2. 将抢占的序列重新加入等待队列
-        3. 请求重试时重新排队
-
-        处理流程：
-        直接将序列追加到waiting队列的尾部，FIFO顺序处理
-        """
+        """将新序列追加到 waiting 队列尾部。"""
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         """
-        执行一次调度决策，选择要处理的序列批次。
+        执行一次调度决策。
 
-        使用方法：
-        通常由LLMEngine.step()调用，无需手动调用
-        seqs, is_prefill = scheduler.schedule()
-
-        返回值：
-        - scheduled_seqs: 选中的序列列表
-        - is_prefill: 是否为prefill阶段
-          * True: prefill阶段，批量处理输入token
-          * False: decode阶段，逐个生成新token
-
-        调度策略：
-
-        1. Prefill阶段（优先处理waiting队列）：
-           - 顺序处理waiting队列中的序列
-           - 直到达到最大序列数或最大token数限制
-           - 检查KV-cache是否足够分配
-           - 分配block并更新状态为RUNNING
-
-        2. Decode阶段（处理running队列）：
-           - 如果waiting为空，处理running中的序列
-           - 检查是否可以追加新token到KV-cache
-           - 内存不足时执行抢占（preemption）
-           - 将序列重新放回队列（preserve顺序）
-
-        使用场景：
-        1. 批量处理新到达的请求（prefill）
-        2. 继续生成进行中的请求（decode）
-        3. 内存回收和负载均衡
+        Returns:
+            (scheduled_seqs, is_prefill):
+            - is_prefill=True: 从 waiting 队列批量取出序列做 prefill
+            - is_prefill=False: 对 running 队列中的序列做 decode，
+              内存不足时执行 preemption
         """
         scheduled_seqs = []
         num_seqs = 0
@@ -190,14 +112,7 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
-        """
-        抢占一个序列，释放其占用的资源。
-
-        使用方法：
-        通常在内存不足时自动调用，无需手动调用
-        scheduler.preempt(seq)
-
-        参数：
+        """抢占序列：释放其 KV-cache 块，状态置为 WAITING 并插入 waiting 队列头部。"""
         - seq: 要抢占的序列
 
         抢占策略：
@@ -225,37 +140,8 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         """
-        后处理序列，更新状态和资源。
-
-        使用方法：
-        通常在模型推理完成后由LLMEngine.step()调用
-        finished_flags = scheduler.postprocess(seqs, token_ids)
-
-        参数：
-        - seqs: 刚处理完的序列列表
-        - token_ids: 生成的token ID列表
-
-        返回值：
-        - finished_flags: 每个序列是否完成的布尔列表
-
-        处理流程：
-        1. 将生成的token添加到序列中
-        2. 检查序列是否应该结束：
-           - 遇到EOS token且未设置ignore_eos
-           - 达到最大生成token数
-        3. 如果序列完成：
-           - 更新状态为FINISHED
-           - 释放KV-cache块
-           - 从运行队列移除
-        4. 否则继续留在运行队列中
-
-        使用场景：
-        1. 每次模型推理后的状态更新
-        2. 完成序列的清理工作
-        3. 资源回收和复用
-
-        注意：
-        只有rank 0（主进程）会调用此方法，因为只有它有采样结果
+        推理后处理：将生成的 token 追加到序列，
+        检查 EOS / max_tokens 终止条件，完成的序列释放资源并移出 running 队列。
         """
         finished_flags = []
 

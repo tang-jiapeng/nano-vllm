@@ -4,22 +4,7 @@ import torch
 
 @dataclass
 class Context:
-    """
-    全局上下文，用于在推理过程中传递信息。
-
-    主要用途：
-    - 在模型的不同组件之间传递上下文信息
-    - 避免在函数参数中传递大量张量
-    - 支持flash-attn的varlen和blocked模式
-
-    字段说明：
-    - is_prefill: 是否为prefill阶段
-    - cu_seqlens_q/k: 累积序列长度（用于varlen attention）
-    - max_seqlen_q/k: 最大序列长度
-    - slot_mapping: KV-cache槽位映射
-    - context_lens: 每个序列的上下文长度
-    - block_tables: 块表（用于blocked KV-cache）
-    """
+    """全局推理上下文，在模型组件间传递 attention 所需的元信息。"""
 
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
@@ -35,19 +20,7 @@ _CONTEXT = Context()
 
 
 def get_context():
-    """
-    获取当前全局上下文。
-
-    使用方法：
-    context = get_context()
-
-    返回值：
-    - 全局Context对象
-
-    使用场景：
-    1. 在模型组件中获取当前推理的上下文信息
-    2. flash-attn需要这些信息进行变长序列处理
-    """
+    """获取当前全局 Context。"""
     return _CONTEXT
 
 
@@ -61,24 +34,7 @@ def set_context(
     context_lens=None,
     block_tables=None,
 ):
-    """
-    设置全局上下文。
-
-    使用方法：
-    set_context(
-        is_prefill=True,
-        cu_seqlens_q=cu_seqlens_q,
-        slot_mapping=slot_mapping
-    )
-
-    参数：
-    - is_prefill: 是否为prefill阶段
-    - 其他参数：见Context类字段说明
-
-    使用场景：
-    1. ModelRunner在推理前设置上下文
-    2. 为模型组件提供必要的上下文信息
-    """
+    """设置全局 Context，由 ModelRunner 在每次推理前调用。"""
     global _CONTEXT
     _CONTEXT = Context(
         is_prefill,
@@ -93,15 +49,6 @@ def set_context(
 
 
 def reset_context():
-    """
-    重置全局上下文为空。
-
-    使用方法：
-    reset_context()
-
-    使用场景：
-    1. 推理完成后清理上下文
-    2. 避免上下文污染下一次推理
-    """
+    """重置全局 Context 为默认空值。"""
     global _CONTEXT
     _CONTEXT = Context()
