@@ -196,3 +196,6 @@ cython_debug/
 Qwen3-0.6B/
 
 docs/
+
+*.csv
+*.png
