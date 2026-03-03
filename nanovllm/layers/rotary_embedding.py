@@ -75,6 +75,11 @@ def get_rope(
     rope_scaling: dict | None = None,
 ) -> RotaryEmbedding:
     """获取 RotaryEmbedding 实例，相同配置复用同一对象。"""
+    # HuggingFace AutoConfig 可能将 rope_scaling=null 填充为
+    # {'rope_type': 'default', ...}，此时等价于标准 RoPE，视为 None
+    if rope_scaling is not None and rope_scaling.get("rope_type") == "default":
+        rope_scaling = None
+
     # 将 rope_scaling dict 转为可哈希 key
     scaling_key = (
         tuple(sorted(rope_scaling.items())) if rope_scaling is not None else None
@@ -82,7 +87,6 @@ def get_rope(
     cache_key = (head_size, rotary_dim, max_position, base, scaling_key)
 
     if cache_key not in _ROPE_CACHE:
-        # 目前仅支持无 rope_scaling 的标准 RoPE
         if rope_scaling is not None:
             raise NotImplementedError(
                 f"rope_scaling 尚未实现: {rope_scaling}。"
