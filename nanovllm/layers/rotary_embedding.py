@@ -1,6 +1,5 @@
 """RoPE（Rotary Positional Embedding）实现，通过旋转操作将位置信息编码到 Q/K 向量中。"""
 
-from functools import lru_cache
 import torch
 from torch import nn
 
@@ -65,15 +64,32 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
+_ROPE_CACHE: dict[tuple, RotaryEmbedding] = {}
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
     rope_scaling: dict | None = None,
-):
-    """通过 LRU 缓存获取 RotaryEmbedding 实例，相同配置复用同一对象。"""
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+) -> RotaryEmbedding:
+    """获取 RotaryEmbedding 实例，相同配置复用同一对象。"""
+    # 将 rope_scaling dict 转为可哈希 key
+    scaling_key = (
+        tuple(sorted(rope_scaling.items())) if rope_scaling is not None else None
+    )
+    cache_key = (head_size, rotary_dim, max_position, base, scaling_key)
+
+    if cache_key not in _ROPE_CACHE:
+        # 目前仅支持无 rope_scaling 的标准 RoPE
+        if rope_scaling is not None:
+            raise NotImplementedError(
+                f"rope_scaling 尚未实现: {rope_scaling}。"
+                "请在 rotary_embedding.py 中添加对应实现。"
+            )
+        _ROPE_CACHE[cache_key] = RotaryEmbedding(
+            head_size, rotary_dim, max_position, base
+        )
+
+    return _ROPE_CACHE[cache_key]
