@@ -31,3 +31,20 @@ def load_model(model: nn.Module, path: str):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, f.get_tensor(weight_name))
+
+def print_model(path: str):
+    for file in glob(os.path.join(path, "*.safetensors")):
+        with safe_open(file, "pt", "cpu") as f:
+            for weight_name in f.keys():
+                print(f"{weight_name} {f.get_tensor(weight_name).shape}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    argparse = argparse.ArgumentParser(description="nano vllm")
+    argparse.add_argument(
+        "--model-path", type=str, default="./models/Qwen3-0.6B"
+    )
+    args = argparse.parse_args()
+    print_model(args.model_path)

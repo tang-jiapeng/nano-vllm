@@ -1,12 +1,8 @@
-"""
-Qwen3 模型实现，包含 Attention、MLP、DecoderLayer、Model 和 CausalLM。
-支持 GQA、RoPE、SwiGLU 和张量并行。
-"""
-
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
-from transformers import Qwen3Config
+from transformers import Qwen3MoeConfig
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -20,8 +16,11 @@ from nanovllm.layers.linear import (
 from nanovllm.layers.rotary_embedding import get_rope
 
 
-class Qwen3Attention(nn.Module):
-    """多头注意力层，支持 GQA、RoPE 和 QK-RMSNorm。"""
+class Qwen3MoeAttention(nn.Module):
+    """
+    多头注意力层，支持 GQA、RoPE 和 QK-RMSNorm
+    Qwen3MoeAttention直接复用Qwen3Attention
+    """
 
     def __init__(
         self,
@@ -109,9 +108,7 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3MLP(nn.Module):
-    """SwiGLU 前馈网络：gate_up 合并投影 -> SiLU(gate) * up -> down 投影。"""
-
+class Qwen3MoeMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -119,56 +116,131 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
         )
-
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        """gate_up 投影 -> SwiGLU 激活 -> down 投影。"""
+        # 经过合并的投影层，输出维度是 [..., intermediate_size * 2]
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
-    """Pre-Norm 解码器层：RMSNorm -> Attention -> RMSNorm -> MLP，带残差连接。"""
-
-    def __init__(
-        self,
-        config: Qwen3Config,
-    ) -> None:
+class Qwen3MoeSparseMoeBlock(nn.Module):
+    def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
 
-        self.self_attn = Qwen3Attention(
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [
+                Qwen3MoeMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    hidden_act=config.hidden_act,
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        seq_len, hidden_dim = hidden_states.shape
+
+        # 路由打分 (Router Logits)
+        # 输入: [seq_len, hidden_dim] -> 输出: [seq_len, num_experts]
+        router_logits = self.gate(hidden_states)
+
+        # 计算路由权重与 Top-K 选择
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        # routing_weights: 每个 token 选中的 K 个专家的权重
+        # selected_experts: 这 K 个专家的索引 (ID)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
+
+        # 根据配置决定是否对 Top-K 权重重新归一化
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        # 初始化最终输出的张量，全为 0
+        final_hidden_states = torch.zeros(
+            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # 构造专家分配掩码 (One-hot 编码)
+        # shape: [num_experts, top_k, seq_len]
+        experts_mask = torch.nn.functional.one_hot(
+            selected_experts, num_classes=self.num_experts
+        ).permute(2, 1, 0)
+
+        # 找出当前 batch 中，有哪些专家被至少一个 Token 命中了
+        expert_hitted = torch.greater(experts_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        # 专家分发与计算 (Dispatch & Compute)
+        for experts_idx in expert_hitted:
+            expert_layer = self.experts[experts_idx]
+
+            # idx: Token 属于它的第几个选择 (top-1 还是 top-2)
+            # top_x: 具体的 Token 索引
+            idx, top_x = torch.where(experts_mask[experts_idx].squeeze(0))
+
+            # 收集属于当前专家的所有 Token 数据 (Gather)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+
+            # 送入对应的专家 MLP 进行前向传播，并乘路由权重
+            current_hidden_states = (
+                expert_layer(current_state) * routing_weights[top_x, idx, None]
+            )
+
+            final_hidden_states.index_add_(
+                0, top_x, current_hidden_states.to(hidden_states.dtype)
+            )
+
+        return final_hidden_states
+
+
+class Qwen3MoeDecoderLayer(nn.Module):
+    def __init__(self, config: Qwen3MoeConfig, layer_idx: int = -1) -> None:
+        super().__init__()
+        self.self_attn = Qwen3MoeAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, "attention_bias", True),
+            qkv_bias=getattr(config, "attention_bias", False),
             head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
-        self.mlp = Qwen3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+
+        if (layer_idx not in mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(config=config)
+        else:
+            self.mlp = Qwen3MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+            )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -181,58 +253,52 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Norm -> Attention -> 残差 -> Norm -> MLP，返回 (hidden_states, residual)。"""
+        # 预归一化与残差处理
         if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        # 注意力计算
         hidden_states = self.self_attn(positions, hidden_states)
+
+        # Post 注意力归一化，更新残差
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # 路由并经过 MLP / MoE
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
-    """Qwen3 Transformer 主干：Embedding -> N × DecoderLayer -> Final RMSNorm。"""
-
-    def __init__(
-        self,
-        config: Qwen3Config,
-    ) -> None:
+class Qwen3MoeModel(nn.Module):
+    def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
-
+        # 词表并行嵌入
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
-
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                Qwen3MoeDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
-
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """词嵌入 -> 逐层前向 -> 最终 RMSNorm，返回 hidden_states。"""
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-
+        # 所有的 Decoder Layer
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-
+        # LayerNorm + Add
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
-    """因果语言模型：Qwen3Model + LM Head，支持 weight tying。"""
-
-    # HuggingFace 权重到合并层的映射
+class Qwen3MoeForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -241,26 +307,19 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Qwen3Config) -> None:
+    def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
-
-        self.model = Qwen3Model(config)
+        self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-
+        # 权重绑定 (LM Head 和 Embedding 共享一套权重)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """调用主干网络，返回 hidden_states。"""
-        return self.model(input_ids, positions)
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.model(input_ids, positions)
+        return hidden_states
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """通过 LM Head 将 hidden_states 映射为 logits。"""
-        return self.lm_head(hidden_states)
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 只取最后一个隐藏状态去算 Logits，生成下一个词
+        logits = self.lm_head(hidden_states)
+        return logits
