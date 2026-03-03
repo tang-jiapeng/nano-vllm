@@ -157,14 +157,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             ]
         )
 
-        # 共享专家 (Shared Expert)
-        self.shared_expert = Qwen3MoeMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.shared_expert_intermediate_size,
-            hidden_act=config.hidden_act,
-        )
-        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
-
     def forward(self, hidden_states: torch.Tensor):
         seq_len, hidden_dim = hidden_states.shape
 
@@ -218,13 +210,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             final_hidden_states.index_add_(
                 0, top_x, current_hidden_states.to(hidden_states.dtype)
             )
-
-        # 共享专家: 所有 Token 都经过 shared_expert，输出通过门控加权
-        shared_expert_output = self.shared_expert(hidden_states)
-        shared_expert_output = (
-            F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-        )
-        final_hidden_states = final_hidden_states + shared_expert_output
 
         return final_hidden_states
 
