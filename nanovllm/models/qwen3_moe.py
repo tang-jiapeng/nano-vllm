@@ -152,7 +152,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             [
                 Qwen3MoeMLP(
                     hidden_size=config.hidden_size,
-                    intermediate_size=config.intermediate_size,
+                    intermediate_size=config.moe_intermediate_size,
                     hidden_act=config.hidden_act,
                 )
                 for _ in range(self.num_experts)
