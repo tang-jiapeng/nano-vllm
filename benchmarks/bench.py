@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from nanovllm import LLM, SamplingParams
 
 # from vllm import LLM, SamplingParams
+# from vllm.inputs import TokensPrompt
 
 
 def main():
@@ -31,9 +32,10 @@ def main():
 
     llm = LLM(
         args.model,
+        # gpu_memory_utilization=0.8,
         enforce_eager=args.enforce_eager,
         max_model_len=4096,
-        chunked_prefill=args.chunked_prefill,
+        # chunked_prefill=args.chunked_prefill,
     )
 
     seed(0)
@@ -41,6 +43,7 @@ def main():
         [randint(0, 10000) for _ in range(randint(100, args.max_input))]
         for _ in range(args.num_seqs)
     ]
+    # prompts = [TokensPrompt(prompt_token_ids=seq) for seq in prompt_token_ids]
     sampling_params = [
         SamplingParams(
             temperature=0.6,
@@ -55,10 +58,12 @@ def main():
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    # llm.generate(prompts, sampling_params, use_tqdm=False)
     t = time.time() - t
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
     mode = "chunked" if args.chunked_prefill else "standard"
+    # mode = "from vllm"
     print(
         f"Total: {total_tokens}tok, Time: {t:.2f}s, "
         f"Throughput: {throughput:.2f}tok/s ({mode})"

@@ -52,3 +52,14 @@ class Config:
             self.max_model_len, self.hf_config.max_position_embeddings
         )
         assert self.max_num_batched_tokens >= self.max_model_len
+
+        # MoE 模型的前向传播使用 nonzero()/torch.where() 等动态形状操作，
+        # 与 CUDA Graph 捕获不兼容，自动强制启用 eager 模式。
+        _MOE_MODEL_TYPES = {"qwen3_moe"}
+        if self.hf_config.model_type in _MOE_MODEL_TYPES and not self.enforce_eager:
+            logger.warning(
+                f"检测到 MoE 模型（model_type={self.hf_config.model_type!r}），"
+                "其前向传播中含有动态形状操作（nonzero/torch.where），"
+                "与 CUDA Graph 不兼容，已自动启用 enforce_eager=True。"
+            )
+            self.enforce_eager = True
