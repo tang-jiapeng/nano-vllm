@@ -34,6 +34,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        awq_config=None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -58,12 +59,14 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            awq_config=awq_config,
         )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            awq_config=awq_config,
         )
 
         self.rotary_emb = get_rope(
@@ -117,6 +120,7 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        awq_config=None,
     ) -> None:
         super().__init__()
 
@@ -124,12 +128,14 @@ class Qwen3MLP(nn.Module):
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            awq_config=awq_config,
         )
 
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            awq_config=awq_config,
         )
 
         assert hidden_act == "silu"
@@ -151,6 +157,7 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        awq_config = getattr(config, "_awq_config", None)
 
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
@@ -162,12 +169,14 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            awq_config=awq_config,
         )
 
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            awq_config=awq_config,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

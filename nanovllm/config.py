@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from transformers import AutoConfig
 
+from nanovllm.layers.quantization.quant_method import AWQConfig
+
 try:
     import flash_attn as _  # noqa: F401
 
@@ -27,6 +29,7 @@ class Config:
     enforce_eager: bool = False
     chunked_prefill: bool = False
     hf_config: AutoConfig | None = None
+    awq_config: AWQConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -63,3 +66,11 @@ class Config:
                 "与 CUDA Graph 不兼容，已自动启用 enforce_eager=True。"
             )
             self.enforce_eager = True
+
+        # 自动检测 AWQ 量化配置
+        self.awq_config = AWQConfig.from_json(self.model)
+        if self.awq_config is not None:
+            logger.info(
+                f"检测到 AWQ 量化模型（weight_bits={self.awq_config.weight_bits}, "
+                f"group_size={self.awq_config.group_size}）。"
+            )

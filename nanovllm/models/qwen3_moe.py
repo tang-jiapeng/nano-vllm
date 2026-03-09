@@ -33,6 +33,7 @@ class Qwen3MoeAttention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        awq_config=None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -57,12 +58,14 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            awq_config=awq_config,
         )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            awq_config=awq_config,
         )
 
         self.rotary_emb = get_rope(
@@ -114,17 +117,20 @@ class Qwen3MoeMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        awq_config=None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            awq_config=awq_config,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            awq_config=awq_config,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -144,6 +150,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        awq_config = getattr(config, "_awq_config", None)
 
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -152,6 +159,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     hidden_size=config.hidden_size,
                     intermediate_size=config.moe_intermediate_size,
                     hidden_act=config.hidden_act,
+                    awq_config=awq_config,
                 )
                 for _ in range(self.num_experts)
             ]
@@ -217,6 +225,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(self, config: Qwen3MoeConfig, layer_idx: int = -1) -> None:
         super().__init__()
+        awq_config = getattr(config, "_awq_config", None)
+
         self.self_attn = Qwen3MoeAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -227,6 +237,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            awq_config=awq_config,
         )
 
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
@@ -240,6 +251,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
+                awq_config=awq_config,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

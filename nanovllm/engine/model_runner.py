@@ -53,6 +53,7 @@ class ModelRunner:
                 f"当前支持: {list(model_dict.keys())}"
             )
         model_cls = model_dict[model_type]
+        hf_config._awq_config = config.awq_config
         self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
