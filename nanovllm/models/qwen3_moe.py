@@ -1,9 +1,9 @@
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3MoeConfig
 
+from nanovllm.kernels.fused_moe import fused_moe
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -144,82 +144,213 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
+    """Qwen3-MoE 稀疏块（堆叠权重 + fused_moe）。"""
+
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.intermediate_size = config.moe_intermediate_size
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
         awq_config = getattr(config, "_awq_config", None)
+        self.is_awq = awq_config is not None
 
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                Qwen3MoeMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    awq_config=awq_config,
+
+        if not self.is_awq:
+            self.w1 = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    2 * self.intermediate_size,
+                    self.hidden_size,
                 )
-                for _ in range(self.num_experts)
-            ]
+            )
+            self.w2 = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.hidden_size,
+                    self.intermediate_size,
+                )
+            )
+            self.w1.weight_loader = self.w1_weight_loader
+            self.w2.weight_loader = self.w2_weight_loader
+        else:
+            g = awq_config.group_size
+            p = awq_config.pack_factor
+            self.pack_factor = p
+
+            self.w1_qweight = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.hidden_size,
+                    (2 * self.intermediate_size) // p,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            self.w1_qzeros = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.hidden_size // g,
+                    (2 * self.intermediate_size) // p,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            self.w1_scales = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.hidden_size // g,
+                    2 * self.intermediate_size,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+
+            self.w2_qweight = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.intermediate_size,
+                    self.hidden_size // p,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            self.w2_qzeros = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.intermediate_size // g,
+                    self.hidden_size // p,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            self.w2_scales = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.intermediate_size // g,
+                    self.hidden_size,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+
+            self.w1_qweight.weight_loader = self.w1_qweight_loader
+            self.w1_qzeros.weight_loader = self.w1_qzeros_loader
+            self.w1_scales.weight_loader = self.w1_scales_loader
+            self.w2_qweight.weight_loader = self.w2_qweight_loader
+            self.w2_qzeros.weight_loader = self.w2_qzeros_loader
+            self.w2_scales.weight_loader = self.w2_scales_loader
+
+    def w1_weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        loaded_shard_id: int,
+    ):
+        shard_size = self.intermediate_size
+        shard_offset = loaded_shard_id * shard_size
+        param.data[expert_id, shard_offset : shard_offset + shard_size].copy_(
+            loaded_weight
         )
+
+    def w2_weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+    ):
+        param.data[expert_id].copy_(loaded_weight)
+
+    def w1_qweight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        loaded_shard_id: int,
+    ):
+        shard_size = self.intermediate_size // self.pack_factor
+        shard_offset = loaded_shard_id * shard_size
+        param.data[expert_id, :, shard_offset : shard_offset + shard_size].copy_(
+            loaded_weight
+        )
+
+    def w1_qzeros_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        loaded_shard_id: int,
+    ):
+        shard_size = self.intermediate_size // self.pack_factor
+        shard_offset = loaded_shard_id * shard_size
+        param.data[expert_id, :, shard_offset : shard_offset + shard_size].copy_(
+            loaded_weight
+        )
+
+    def w1_scales_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+        loaded_shard_id: int,
+    ):
+        shard_size = self.intermediate_size
+        shard_offset = loaded_shard_id * shard_size
+        param.data[expert_id, :, shard_offset : shard_offset + shard_size].copy_(
+            loaded_weight
+        )
+
+    def w2_qweight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+    ):
+        param.data[expert_id].copy_(loaded_weight)
+
+    def w2_qzeros_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+    ):
+        param.data[expert_id].copy_(loaded_weight)
+
+    def w2_scales_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        expert_id: int,
+    ):
+        param.data[expert_id].copy_(loaded_weight)
 
     def forward(self, hidden_states: torch.Tensor):
-        seq_len, hidden_dim = hidden_states.shape
-
-        # 路由打分 (Router Logits)
-        # 输入: [seq_len, hidden_dim] -> 输出: [seq_len, num_experts]
         router_logits = self.gate(hidden_states)
-
-        # 计算路由权重与 Top-K 选择
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        # routing_weights: 每个 token 选中的 K 个专家的权重
-        # selected_experts: 这 K 个专家的索引 (ID)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-
-        # 根据配置决定是否对 Top-K 权重重新归一化
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
-
-        # 初始化最终输出的张量，全为 0
-        final_hidden_states = torch.zeros(
-            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # 构造专家分配掩码 (One-hot 编码)
-        # shape: [num_experts, top_k, seq_len]
-        experts_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
-
-        # 找出当前 batch 中，有哪些专家被至少一个 Token 命中了
-        expert_hitted = torch.greater(experts_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        # 专家分发与计算 (Dispatch & Compute)
-        for experts_idx in expert_hitted:
-            expert_layer = self.experts[experts_idx]
-
-            # idx: Token 属于它的第几个选择 (top-1 还是 top-2)
-            # top_x: 具体的 Token 索引
-            idx, top_x = torch.where(experts_mask[experts_idx].squeeze(0))
-
-            # 收集属于当前专家的所有 Token 数据 (Gather)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-
-            # 送入对应的专家 MLP 进行前向传播，并乘路由权重
-            current_hidden_states = (
-                expert_layer(current_state) * routing_weights[top_x, idx, None]
+        if self.is_awq:
+            return fused_moe(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                norm_topk_prob=self.norm_topk_prob,
+                w1_qweight=self.w1_qweight,
+                w1_qzeros=self.w1_qzeros,
+                w1_scales=self.w1_scales,
+                w2_qweight=self.w2_qweight,
+                w2_qzeros=self.w2_qzeros,
+                w2_scales=self.w2_scales,
             )
 
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
-
-        return final_hidden_states
+        return fused_moe(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            norm_topk_prob=self.norm_topk_prob,
+            w1=self.w1,
+            w2=self.w2,
+        )
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
