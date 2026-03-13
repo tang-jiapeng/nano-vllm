@@ -659,75 +659,9 @@ class ModelRunner:
 
     # ── 推测解码核心 ──
 
-    def _precompute_draft_decode_inputs(self, seqs: list[Sequence], n_steps: int):
-        """
-        在 draft 解码循环前一次性预计算所有 n_steps 步的输入张量，
-        消除循环内重复的 CPU→GPU 数据搬运和 Python 对象创建开销。
-
-        返回已在 GPU 上的张量：
-          positions_all : [n_steps, B] int64  — 每步每条序列的位置索引
-          slots_all     : [n_steps, B] int32  — 每步每条序列的 KV slot
-          ctx_lens_all  : [n_steps, B] int32  — 每步每条序列的上下文长度
-          block_tables  : [B, max_blocks] int32 — draft 模型 KV 块表（各步共用）
-        """
-        B = len(seqs)
-        bs = self.block_size
-
-        positions_list: list[list[int]] = []
-        slots_list: list[list[int]] = []
-        ctx_lens_list: list[list[int]] = []
-
-        for rel_t in range(n_steps):
-            pos_t: list[int] = []
-            slot_t: list[int] = []
-            ctx_t: list[int] = []
-            for seq in seqs:
-                N = len(seq)             # 在本次 generate_draft_tokens 调用中的"基准"长度
-                pos = N - 1 + rel_t      # 当前 token 在全序列中的位置
-                ctx = N + rel_t          # 本步注意力覆盖的 token 数
-                block_idx = pos // bs
-                slot = seq.draft_block_table[block_idx] * bs + pos % bs
-                pos_t.append(pos)
-                slot_t.append(slot)
-                ctx_t.append(ctx)
-            positions_list.append(pos_t)
-            slots_list.append(slot_t)
-            ctx_lens_list.append(ctx_t)
-
-        # 构建 draft block_tables（各步共用）
-        tables = [seq.draft_block_table for seq in seqs]
-        max_blocks = max(len(t) for t in tables)
-        bt_rows = [t + [-1] * (max_blocks - len(t)) for t in tables]
-
-        # 一次性 pinned-memory 分配 + 异步 H→D 搬运
-        positions_gpu = torch.tensor(
-            positions_list, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)   # [n_steps, B]
-        slots_gpu = torch.tensor(
-            slots_list, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)   # [n_steps, B]
-        ctx_lens_gpu = torch.tensor(
-            ctx_lens_list, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)   # [n_steps, B]
-        bt_gpu = torch.tensor(
-            bt_rows, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)   # [B, max_blocks]
-
-        return positions_gpu, slots_gpu, ctx_lens_gpu, bt_gpu
-
     @torch.inference_mode()
     def generate_draft_tokens(self, seqs, temps, device, dtype):
-        """
-        用 draft 模型循环生成 K 个候选 token。
-
-        优化要点：
-        1. 在循环前一次性预计算所有步的 positions / slot_mapping / context_lens，
-           避免每步重复构建 CPU 列表并搬运至 GPU。
-        2. 将前一步采样得到的 next_tokens 直接作为下一步 input_ids（保持在 GPU
-           上），彻底消除循环内的 GPU→CPU 同步（每步 B 次 .item() 调用）。
-        3. 全部 K 步结束后用一次 .tolist() 将 draft_tokens 批量拷贝回 CPU，
-           再统一更新各序列的 Python 状态。
-        """
+        """用 draft 模型循环生成 K 个候选 token。"""
         B = len(seqs)
         K = self.num_speculative_tokens
         vocab_size = self.model.lm_head.num_embeddings
@@ -738,68 +672,37 @@ class ModelRunner:
             (B, K, vocab_size), dtype=torch.float32, device=device
         )
 
-        # ── Step 0 (可选 prefill) ──────────────────────────────────────────
-        # 若 draft cache 落后于当前序列，先做一次 prefill 把缺失的 KV 补齐。
+        # 判断 draft 模型是否需要先做一次 prefill（同步落后的 token）
         needs_prefill = any(seq.draft_num_cached_tokens < len(seq) - 1 for seq in seqs)
-        t_start = 0
 
-        if needs_prefill:
-            input_ids, positions = self.prepare_draft_prefill(seqs)
-            logits = self.run_draft_model(input_ids, positions)
-            # prefill 返回所有输入 token 的 logits；取每条序列最后一个位置。
-            if logits.size(0) != B:
-                context = get_context()
-                last_indices = context.cu_seqlens_q[1:] - 1
-                logits = logits[last_indices]
+        for t in range(K):
+            if t == 0 and needs_prefill:
+                input_ids, positions = self.prepare_draft_prefill(seqs)
+                logits = self.run_draft_model(input_ids, positions)
+                # prefill 可能已在 lm_head 中归约为 [B, V]（每个 seq 一个 logit）；
+                # 仅当输出仍是逐 token 形状时再按 last_indices 取最后位置。
+                if logits.size(0) != B:
+                    context = get_context()
+                    last_indices = context.cu_seqlens_q[1:] - 1
+                    logits = logits[last_indices]
+            else:
+                input_ids, positions = self.prepare_draft_decode(seqs)
+                logits = self.run_draft_model(input_ids, positions)
+
             reset_context()
-
             next_tokens, probs = self.sampler(logits, temps, return_probs=True)
-            draft_tokens[:, 0] = next_tokens
-            draft_probs[:, 0] = probs
+            draft_tokens[:, t] = next_tokens
+            draft_probs[:, t] = probs
 
-            # prefill 步必须同步到 CPU 以更新序列状态（后续预计算依赖 len(seq)）
-            tokens_step0 = next_tokens.tolist()
+            # 用一次 .tolist() 把 B 个 token 批量拷贝回 CPU，
+            # 代替 B 次独立的 .item() 调用，减少 GPU→CPU 同步次数。
+            step_tokens = next_tokens.tolist()
             for i, seq in enumerate(seqs):
-                seq.append_token(tokens_step0[i])
-                seq.draft_num_cached_tokens = len(seq) - 1
-
-            t_start = 1
-
-        # ── Steps t_start … K-1（纯 decode，CUDA Graph 路径）────────────────
-        n_decode = K - t_start
-        if n_decode > 0:
-            # 在循环外预计算所有步的 GPU 张量（一次 H→D 搬运）
-            pos_all, slot_all, ctx_all, bt_all = self._precompute_draft_decode_inputs(
-                seqs, n_decode
-            )
-
-            # 初始 input_ids：当前各序列末尾 token（一次 CPU→GPU 搬运）
-            cur_input = torch.tensor(
-                [seq.last_token for seq in seqs], dtype=torch.int64, pin_memory=True
-            ).cuda(non_blocking=True)
-
-            for rel_t in range(n_decode):
-                t = t_start + rel_t
-                set_context(
-                    slot_mapping=slot_all[rel_t],
-                    context_lens=ctx_all[rel_t],
-                    block_tables=bt_all,
-                )
-                logits = self.run_draft_model(cur_input, pos_all[rel_t])
-                reset_context()
-
-                next_tokens, probs = self.sampler(logits, temps, return_probs=True)
-                draft_tokens[:, t] = next_tokens
-                draft_probs[:, t] = probs
-
-                # input_ids 保持在 GPU 上，不做 CPU 同步
-                cur_input = next_tokens
-
-            # 循环结束后，将 decode 阶段产出的全部 token 一次性拷贝回 CPU
-            decode_tokens_cpu = draft_tokens[:, t_start:].tolist()   # [B, n_decode]
-            for i, seq in enumerate(seqs):
-                for rel_t in range(n_decode):
-                    seq.append_token(decode_tokens_cpu[i][rel_t])
+                seq.append_token(step_tokens[i])
+                # 更新 draft cache 计数
+                if t == 0 and needs_prefill:
+                    seq.draft_num_cached_tokens = len(seq) - 1
+                else:
                     seq.draft_num_cached_tokens += 1
 
         return draft_tokens, draft_probs
@@ -857,7 +760,7 @@ class ModelRunner:
         sampled_tokens = torch.multinomial(final_probs, num_samples=1).squeeze(1)
         final_tokens = torch.where(temps == 0, greedy_tokens, sampled_tokens)
 
-        # 将 GPU 张量一次性批量拷贝到 CPU，消除逐条序列的 .item() / .tolist() 同步
+        # 用两次批量 .tolist() 代替每条序列的 .item() 调用，减少 GPU→CPU 同步。
         num_accepted_cpu = num_accepted.tolist()
         draft_tokens_cpu = draft_tokens.tolist()   # [B, K]
 
