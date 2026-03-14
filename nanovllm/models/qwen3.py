@@ -18,6 +18,7 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.utils.context import get_context
 
 
 class Qwen3Attention(nn.Module):
@@ -108,7 +109,10 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
+        if get_context().is_speculative and o.dim() == 4:
+            output = self.o_proj(o.flatten(2, -1).reshape(-1, self.q_size))
+        else:
+            output = self.o_proj(o.flatten(1, -1))
         return output
 
 

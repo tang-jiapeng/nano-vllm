@@ -30,6 +30,10 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--chunked-prefill", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--speculative-method", choices=["ngram"], default=None)
+    parser.add_argument("--num-speculative-tokens", type=int, default=0)
+    parser.add_argument("--ngram-prompt-lookup-min", type=int, default=1)
+    parser.add_argument("--ngram-prompt-lookup-max", type=int, default=4)
     args = parser.parse_args()
 
     # 初始化异步引擎
@@ -41,6 +45,10 @@ def main():
         enforce_eager=args.enforce_eager,
         chunked_prefill=args.chunked_prefill,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        speculative_method=args.speculative_method,
+        num_speculative_tokens=args.num_speculative_tokens,
+        ngram_prompt_lookup_min=args.ngram_prompt_lookup_min,
+        ngram_prompt_lookup_max=args.ngram_prompt_lookup_max,
     )
     engine_instance.start()
 

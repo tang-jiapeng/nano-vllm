@@ -54,7 +54,13 @@ class BlockManager:
     - chunked prefill（一次分配多个新块）
     """
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        speculative_decoding: bool = False,
+        num_speculative_tokens: int = 0,
+    ):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
@@ -62,6 +68,8 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         # LRU 缓存：hash → block_id，最近使用的在末尾
         self.cached_blocks: OrderedDict[int, int] = OrderedDict()
+        self.speculative_decoding = speculative_decoding
+        self.num_speculative_tokens = num_speculative_tokens
 
     @property
     def num_free_blocks(self):
@@ -285,6 +293,12 @@ class BlockManager:
             (num_new_tokens - last_block_capacity + self.block_size - 1)
             // self.block_size,
         )
+        if self.speculative_decoding:
+            target_tokens = (
+                seq.num_cached_tokens + num_new_tokens + self.num_speculative_tokens
+            )
+            target_blocks = (target_tokens + self.block_size - 1) // self.block_size
+            needed = max(needed, max(0, target_blocks - len(seq.block_table)))
         return self.num_free_blocks >= needed
 
     def may_append(self, seq: Sequence):
@@ -323,6 +337,16 @@ class BlockManager:
                 self.hash_to_block_id[h] = current_block.block_id
             elif current_block_id == -1:
                 # 新的不完整块
+                block_id = self._get_new_block_id()
+                assert block_id != -1
+                seq.block_table.append(block_id)
+
+        if self.speculative_decoding:
+            target_tokens = (
+                seq.num_cached_tokens + seq.num_new_tokens + self.num_speculative_tokens
+            )
+            target_blocks = (target_tokens + self.block_size - 1) // self.block_size
+            while len(seq.block_table) < target_blocks:
                 block_id = self._get_new_block_id()
                 assert block_id != -1
                 seq.block_table.append(block_id)

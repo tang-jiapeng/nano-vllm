@@ -48,6 +48,15 @@ class Sequence:
         # KV-cache块表，记录该序列使用的所有块
         self.block_table = []
 
+        # Speculative 解码状态
+        self.is_speculative = False
+        self.speculative_draft_tokens: list[int] = []
+        self.pending_accepted_tokens: list[int] = []
+
+        # Speculative 统计
+        self.num_speculative_proposed_total = 0
+        self.num_speculative_accepted_total = 0
+
         # 采样参数
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -112,6 +121,18 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def pop_last_n_tokens(self, n: int):
+        """从序列尾部弹出 n 个 token（至少保留 1 个 token）。"""
+        if n <= 0:
+            return
+        max_pop = max(0, self.num_tokens - 1)
+        n = min(n, max_pop)
+        if n == 0:
+            return
+        del self.token_ids[-n:]
+        self.num_tokens -= n
+        self.last_token = self.token_ids[-1]
+
     def __getstate__(self):
         """pickle 序列化：用于 tensor parallel 跨进程传输。"""
         return (
@@ -122,7 +143,14 @@ class Sequence:
             self.num_cached_tokens,
             self.num_new_tokens,
             self.block_table,
+            self.is_speculative,
+            self.speculative_draft_tokens,
+            self.pending_accepted_tokens,
+            self.num_speculative_proposed_total,
+            self.num_speculative_accepted_total,
             self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
         )
 
     def __setstate__(self, state):
@@ -135,5 +163,12 @@ class Sequence:
             self.num_cached_tokens,
             self.num_new_tokens,
             self.block_table,
+            self.is_speculative,
+            self.speculative_draft_tokens,
+            self.pending_accepted_tokens,
+            self.num_speculative_proposed_total,
+            self.num_speculative_accepted_total,
             self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
         ) = state

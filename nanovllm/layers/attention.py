@@ -141,8 +141,17 @@ class Attention(nn.Module):
                 block_table=context.block_tables,
             )
         else:
+            if context.is_speculative:
+                q = q.reshape(
+                    -1,
+                    context.num_speculative_tokens + 1,
+                    self.num_heads,
+                    self.head_dim,
+                )
+            else:
+                q = q.unsqueeze(1)
             return flash_attn_with_kvcache(
-                q.unsqueeze(1),
+                q,
                 k_cache,
                 v_cache,
                 cache_seqlens=context.context_lens,

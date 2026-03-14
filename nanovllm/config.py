@@ -28,6 +28,11 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     chunked_prefill: bool = False
+    speculative_method: str | None = None
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 0
+    ngram_prompt_lookup_min: int = 1
+    ngram_prompt_lookup_max: int = 4
     hf_config: AutoConfig | None = None
     awq_config: AWQConfig | None = None
     eos: int = -1
@@ -36,6 +41,23 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.speculative_method is None and self.speculative_model is not None:
+            if self.speculative_model.lower() in {"ngram", "[ngram]"}:
+                self.speculative_method = "ngram"
+            else:
+                raise ValueError(
+                    "draft-model speculative decoding has been removed. "
+                    "Use speculative_method='ngram' instead."
+                )
+        if self.speculative_method is not None:
+            self.speculative_method = self.speculative_method.lower()
+            assert self.num_speculative_tokens > 0
+            assert self.speculative_method == "ngram", (
+                f"unsupported speculative_method={self.speculative_method!r}; "
+                "only 'ngram' is currently supported"
+            )
+            assert self.ngram_prompt_lookup_min >= 1
+            assert self.ngram_prompt_lookup_max >= self.ngram_prompt_lookup_min
         if HAS_FLASH_ATTN:
             assert (
                 self.kvcache_block_size % 256 == 0
@@ -48,6 +70,10 @@ class Config:
             logger.warning(
                 "flash-attn is not installed, using Triton attention kernel. "
                 "Install flash-attn for best performance: pip install flash-attn"
+            )
+            assert self.speculative_method is None, (
+                "ngram speculative decoding currently requires flash-attn. "
+                "Please install flash-attn or disable speculative decoding."
             )
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
